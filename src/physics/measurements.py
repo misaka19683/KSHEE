@@ -2,13 +2,29 @@ import numpy as np
 import pandas as pd
 from tenpy import MPS
 
+def _get_bc_type(model) -> str:
+    """Return 'open' or 'periodic' based on model.lat.boundary_conditions or model.lat.bc."""
+    lat = getattr(model, 'lat', None)
+    if lat is None: return "open"
+    for attr in ["boundary_conditions", "bc"]:
+        val = getattr(lat, attr, [])
+        vals = [val] if isinstance(val, (str, bool)) else val
+        if any(v is True or (isinstance(v, str) and "periodic" in v.lower()) for v in vals):
+            return "periodic"
+    return "open"
 
 def calc_nn_bond_energies(psi:MPS, model):
     """
     Calculate nearest-neighbor bond energies for the Kitaev-Gamma chain.
+
+    For OBC: returns length (L-1) bonds: (0,1)...(L-2,L-1)
+    For PBC: returns length L bonds, including the wrap bond: (L-1,0)
     """
     L = psi.L
-    E_bonds = np.zeros(L - 1)
+    bc_type = _get_bc_type(model)
+
+    n_bonds = L if bc_type == "periodic" else L - 1
+    E_bonds = np.zeros(n_bonds, dtype=float)
     
     # Get parameters from model options
     j = model.options.get('j', 0.)
@@ -28,8 +44,8 @@ def calc_nn_bond_energies(psi:MPS, model):
     L_in_plus = lambda_in_dp + lambda_in_dn
     L_in_minus = lambda_in_dp - lambda_in_dn
 
-    for i in range(L - 1):
-        j_site = i + 1
+    for i in range(n_bonds):
+        j_site = (i + 1) % L
         bond_type = i % 2
         E_bond = 0.0
         
@@ -87,10 +103,15 @@ def calc_total_bond_energies(psi: MPS, model):
     """
     Calculate bond energies including Next-Nearest Neighbor (NNN) terms.
     The energy of the NNN interaction (i, i+2) is added to the bond E_bonds[i].
+
+    Convention:
+    - We add energy(i, i+2) to the bond index i.
+    - For PBC, indices wrap around.
     """
     # First, calculate the NN part using the existing logic
     E_bonds = calc_nn_bond_energies(psi, model)
     L = psi.L
+    bc_type = _get_bc_type(model)
 
     # Get NNN parameters
     k2 = model.options.get('k2', 0.)
@@ -100,10 +121,13 @@ def calc_total_bond_energies(psi: MPS, model):
     if abs(k2) < 1e-12 and abs(j2) < 1e-12:
         return E_bonds
 
+    n_bonds = L if bc_type == "periodic" else L - 1
+    n_terms = L if bc_type == "periodic" else L - 2
+
     # Iterate again to add NNN terms
     # We add energy(i, i+2) to E_bonds[i]
-    for i in range(L - 2):
-        k_site = i + 2
+    for i in range(n_terms):
+        k_site = (i + 2) % L
         E_nnn = 0.0
 
         # K2 S^z_i S^z_{i+2}
@@ -115,15 +139,29 @@ def calc_total_bond_energies(psi: MPS, model):
             for op in ['Sx', 'Sy', 'Sz']:
                 E_nnn += j2 * np.real(psi.expectation_value_term([(op, i), (op, k_site)]))
 
-        # Add to the bond at site i (which connects i and i+1)
-        E_bonds[i] += E_nnn
+        # add to the bond index i (which exists for both OBC/PBC in this convention)
+        E_bonds[i % n_bonds] += E_nnn
 
     return E_bonds
 
-def extract_alternating_energy(E_bonds):
+def extract_alternating_energy(E_bonds, bc_type="open"):
     """
     Extract the alternating component of the energy density.
+
+    For OBC: use pandas shift and drop boundaries.
+    For PBC: use circular neighbors (np.roll), no dropna.
     """
+    E_bonds = np.asarray(E_bonds, dtype=float)
+
+    if bc_type == "periodic":
+        left = np.roll(E_bonds, 1)
+        right = np.roll(E_bonds, -1)
+        E_local_avg = 0.5 * (left + right)
+        E_A = np.abs(E_bonds - E_local_avg)
+        # Return pandas Series to keep downstream code unchanged-ish
+        idx = np.arange(len(E_bonds))
+        return pd.Series(E_A, index=idx), pd.Series(E_local_avg, index=idx)
+
     E_series = pd.Series(E_bonds)
     E_local_avg = (E_series.shift(1) + E_series.shift(-1)) / 2.0
     E_A = (E_series - E_local_avg).abs().dropna()
@@ -149,7 +187,7 @@ def fit_luttinger_parameter(E_A, L_total, eps=1e-12, min_points=6, use_robust=Fa
     min_points : int
         Minimum number of points required for fitting.
     use_robust : bool
-        If True, use Iteratively Reweighted Least Squares (IRLS) with Huber weights.
+        If True, use Iteratively Reweighted The Least Squares (IRLS) with Huber weights.
 
     Returns
     -------
@@ -186,11 +224,12 @@ def fit_luttinger_parameter(E_A, L_total, eps=1e-12, min_points=6, use_robust=Fa
         if not use_robust:
             slope, intercept = np.polyfit(log_x, log_y, 1)
         else:
-            # Simple Huber-IRLS (Iteratively Reweighted Least Squares)
+            # Simple Huber-IRLS (Iteratively Reweighted The Least Squares)
             # This is more robust against outliers
             X = np.vstack([log_x, np.ones_like(log_x)]).T
             w = np.ones_like(log_x)
 
+            beta = np.array([0.0, 0.0])
             for _ in range(15):  # Iterate to converge weights
                 W = np.sqrt(w)
                 # Weighted least squares
@@ -210,66 +249,11 @@ def fit_luttinger_parameter(E_A, L_total, eps=1e-12, min_points=6, use_robust=Fa
 
     return kappa, [slope, intercept], x_data, y_data
 
-def fit_luttinger_parameter_middle_half(E_A, L_total, eps=1e-12, min_points=6, use_robust=False):
-    """
-    与原 fit_luttinger_parameter 返回格式完全一致：
-    return kappa, [slope, intercept], x_data, y_data
-
-    其中 x_data, y_data 被替换为“原函数有效点的中间一半”，并在该子集上重新拟合。
-    """
-    # 1) 先用原函数得到有效点（以及原拟合结果，但这里主要复用 x/y）
-    kappa0, p0, x_data, y_data = fit_luttinger_parameter(
-        E_A, L_total, eps=eps, min_points=min_points, use_robust=use_robust
-    )
-
-    x = np.asarray(x_data, dtype=float)
-    y = np.asarray(y_data, dtype=float)
-
-    # 2) 取中间一半（按当前顺序）
-    n = len(x)
-    if n == 0:
-        return np.nan, [np.nan, np.nan], x, y
-
-    keep = n // 2  # 保留一半（向下取整）
-    start = (n - keep) // 2
-    end = start + keep
-
-    x_mid = x[start:end]
-    y_mid = y[start:end]
-
-    # 3) 在中间一半上重新拟合；若点数不够，按原格式返回 NaN
-    if len(x_mid) < min_points:
-        return np.nan, [np.nan, np.nan], x_mid, y_mid
-
-    log_x = np.log(x_mid)
-    log_y = np.log(y_mid)
-
-    if not use_robust:
-        slope, intercept = np.polyfit(log_x, log_y, 1)
-    else:
-        X = np.vstack([log_x, np.ones_like(log_x)]).T
-        w = np.ones_like(log_x)
-        beta = np.array([0.0, 0.0])
-
-        for _ in range(15):
-            W = np.sqrt(w)
-            beta, *_ = np.linalg.lstsq(X * W[:, None], log_y * W, rcond=None)
-            resid = log_y - (X @ beta)
-
-            s = 1.4826 * np.median(np.abs(resid - np.median(resid))) + 1e-15
-            c = 1.345 * s
-            w = np.where(np.abs(resid) <= c, 1.0, c / np.abs(resid))
-
-        slope, intercept = float(beta[0]), float(beta[1])
-
-    kappa = -float(slope)
-    return kappa, [float(slope), float(intercept)], x_mid, y_mid
-
-
-def calculate_central_charge(psi: MPS, L: int):
+def calculate_central_charge(psi: MPS, L: int, bc_type="open"):
     """
     Calculate the central charge from entanglement entropy.
     S(x) = (c/6) * ln[sin(pi*x/L)] + constant (for OBC)
+    S(x) = (c/3) * ln[sin(pi*x/L)] + constant (for PBC)
 
     Parameters
     ----------
@@ -277,6 +261,8 @@ def calculate_central_charge(psi: MPS, L: int):
         The ground state MPS.
     L : int
         Number of sites.
+    bc_type : str, optional
+        Boundary condition type, either "open" or "periodic". Default is "open".
 
     Returns
     -------
@@ -285,40 +271,38 @@ def calculate_central_charge(psi: MPS, L: int):
         - 'c_avg': Averaged central charge from odd and even sites.
         - 'odd', 'even': Dicts with 'c', 'intercept', 'x_fit', 'S_fit' for each parity.
         - 'S': All entanglement entropy values.
-        - 'x_plot': All (1/6)*ln(sin) values.
+        - 'x_plot': All ln((L/pi)*sin(pi*x/L)) values.
     """
-    # 1. 获取纠缠熵
     S = psi.entanglement_entropy()
     x_real = np.arange(1, L)
 
-    # 2. 定义拟合区间 (L/8 to 7L/8)
     mask_range = (x_real >= L // 8) & (x_real <= 7 * L // 8)
 
-    # 3. 计算横坐标
     sin_val = np.sin(np.pi * x_real / L)
-    sin_val = np.maximum(sin_val, 1e-10)
-    x_plot = (1.0 / 6.0) * np.log(sin_val)
+    sin_val = np.maximum(sin_val, 1e-12)
+    x_plot = np.log((L / np.pi) * sin_val)
 
-    # 4. 分离奇偶点并拟合
-    # 奇数点 (MPS 索引 0, 2, ... 对应物理点 1, 3, ...)
+    lam = 1.0 if bc_type == "periodic" else 0.5
+
     mask_odd = mask_range & ((x_real % 2) != 0)
     x_odd = x_plot[mask_odd]
     S_odd = S[mask_odd]
 
-    # 偶数点 (MPS 索引 1, 3, ... 对应物理点 2, 4, ...)
     mask_even = mask_range & ((x_real % 2) == 0)
     x_even = x_plot[mask_even]
     S_even = S[mask_even]
 
-    res = {'S': S, 'x_plot': x_plot, 'L': L}
+    res = {'S': S, 'x_plot': x_plot, 'L': L, 'bc_type': bc_type}
 
     if len(x_odd) > 2:
-        coeffs_odd = np.polyfit(x_odd, S_odd, 1)
-        res['odd'] = {'c': coeffs_odd[0], 'intercept': coeffs_odd[1], 'x_fit': x_odd, 'S_fit': S_odd}
+        slope, intercept = np.polyfit(x_odd, S_odd, 1)
+        c_odd = slope * 3.0 / lam
+        res['odd'] = {'c': c_odd, 'slope': slope, 'intercept': intercept, 'x_fit': x_odd, 'S_fit': S_odd}
 
     if len(x_even) > 2:
-        coeffs_even = np.polyfit(x_even, S_even, 1)
-        res['even'] = {'c': coeffs_even[0], 'intercept': coeffs_even[1], 'x_fit': x_even, 'S_fit': S_even}
+        slope, intercept = np.polyfit(x_even, S_even, 1)
+        c_even = slope * 3.0 / lam
+        res['even'] = {'c': c_even, 'slope': slope, 'intercept': intercept, 'x_fit': x_even, 'S_fit': S_even}
 
     c_odd = res.get('odd', {}).get('c', np.nan)
     c_even = res.get('even', {}).get('c', np.nan)
@@ -335,37 +319,88 @@ def calculate_central_charge(psi: MPS, L: int):
     return res
 
 
+def calculate_dimerization(psi: MPS, model):
+    """
+    Calculate dimerization order parameter.
+    First calculate rotated bond energies B'_i, then O_i = B'_{i+1} - B'_i.
+    """
+    L = psi.L
+    bc_type = _get_bc_type(model)
+    n_bonds = L if bc_type == "periodic" else L - 1
+    
+    b_prime = np.zeros(n_bonds)
+    for i in range(n_bonds):
+        j = (i + 1) % L
+        # i is a 0-based index.
+        # i=0, 2, ... (even i) corresponds to Type 1 bond (1-2, 3-4...)
+        # i=1, 3, ... (odd i) corresponds to Type 2 bond (2-3, 4-5...)
+        
+        if i % 2 == 0:
+            # Type 1 bond: -SxSx + SySz + SzSy
+            val = -psi.expectation_value_term([('Sx', i), ('Sx', j)]) \
+                  + psi.expectation_value_term([('Sy', i), ('Sz', j)]) \
+                  + psi.expectation_value_term([('Sz', i), ('Sy', j)])
+        else:
+            # Type 2 bond: -SySy + SzSx + SxSz
+            val = -psi.expectation_value_term([('Sy', i), ('Sy', j)]) \
+                  + psi.expectation_value_term([('Sz', i), ('Sx', j)]) \
+                  + psi.expectation_value_term([('Sx', i), ('Sz', j)])
+        b_prime[i] = np.real(val)
+    
+    dimer = np.zeros(n_bonds)
+    for i in range(n_bonds):
+        dimer[i] = b_prime[(i + 1) % n_bonds] - b_prime[i]
+        
+    return dimer
+
+
 def perform_full_analysis(psi: MPS, model, title=""):
     """
-    Perform a full analysis of the MPS state:
-    1. Bond energies and alternating component.
-    2. Luttinger parameter fitting.
-    3. Central charge calculation.
+    Full analysis:
+    - OBC: calculate Luttinger parameter (kappa) and central charge.
+    - PBC: calculate central charge and dimerization.
     """
     L = model.lat.N_sites
+    bc_type = _get_bc_type(model)
 
     # 1. Bond Energies
     E_bonds = calc_nn_bond_energies(psi, model)
-    E_A, E_local_avg = extract_alternating_energy(E_bonds)
-
-    # 2. Luttinger parameter fitting
-    kappa, p_luttinger, x_luttinger, y_luttinger = fit_luttinger_parameter(E_A, L)
-
-    # 3. Central charge calculation
-    cc_res = calculate_central_charge(psi, L)
+    E_A, E_local_avg = extract_alternating_energy(E_bonds, bc_type=bc_type)
 
     results = {
         'title': title,
         'L': L,
+        'bc_type': bc_type,
         'E_bonds': E_bonds,
         'E_A': E_A,
         'E_local_avg': E_local_avg,
-        'kappa': kappa,
-        'p_luttinger': p_luttinger,
-        'x_luttinger': x_luttinger,
-        'y_luttinger': y_luttinger,
-        'cc_res': cc_res
     }
+
+    # 2. Luttinger parameter fitting (Only for OBC)
+    if bc_type == "open":
+        kappa, p_luttinger, x_luttinger, y_luttinger = fit_luttinger_parameter(E_A, L)
+        results.update({
+            'kappa': kappa,
+            'p_luttinger': p_luttinger,
+            'x_luttinger': x_luttinger,
+            'y_luttinger': y_luttinger,
+        })
+    else:
+        results.update({
+            'kappa': np.nan,
+            'p_luttinger': None,
+            'x_luttinger': None,
+            'y_luttinger': None,
+        })
+
+    # 3. Central charge (Both OBC and PBC)
+    cc_res = calculate_central_charge(psi, L, bc_type=bc_type)
+    results['cc_res'] = cc_res
+
+    # 4. Dimerization (Only for PBC)
+    if bc_type == "periodic":
+        dimer_res = calculate_dimerization(psi, model)
+        results['dimerization'] = dimer_res
 
     return results
 
